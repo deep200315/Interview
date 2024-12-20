@@ -22,27 +22,10 @@ import { WavRenderer } from '../utils/wav_renderer';
 import { X, Edit, Zap, ArrowUp, ArrowDown } from 'react-feather';
 import { Button } from '../components/button/Button';
 import { Toggle } from '../components/toggle/Toggle';
-import { Map } from '../components/Map';
 
 import './ConsolePage.scss';
 import { isJsxOpeningLikeElement } from 'typescript';
-
-/**
- * Type for result from get_weather() function call
- */
-interface Coordinates {
-  lat: number;
-  lng: number;
-  location?: string;
-  temperature?: {
-    value: number;
-    units: string;
-  };
-  wind_speed?: {
-    value: number;
-    units: string;
-  };
-}
+import { InterviewPage } from './InterviewPage';
 
 /**
  * Type for all event logs
@@ -52,6 +35,13 @@ interface RealtimeEvent {
   source: 'client' | 'server';
   count?: number;
   event: { [key: string]: any };
+}
+
+interface TurnDetectionServerVadType {
+  type: 'server_vad';
+  threshold?: number;
+  prefix_padding_ms?: number;
+  silence_duration_ms?: number;
 }
 
 export function ConsolePage() {
@@ -96,34 +86,30 @@ export function ConsolePage() {
    * - Rendering audio visualization (canvas)
    * - Autoscrolling event logs
    * - Timing delta for event log displays
+   * - Media stream for screen recording
    */
   const clientCanvasRef = useRef<HTMLCanvasElement>(null);
   const serverCanvasRef = useRef<HTMLCanvasElement>(null);
   const eventsScrollHeightRef = useRef(0);
   const eventsScrollRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<string>(new Date().toISOString());
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
   /**
    * All of our variables for displaying application state
    * - items are all conversation items (dialog)
    * - realtimeEvents are event logs, which can be expanded
-   * - memoryKv is for set_memory() function
-   * - coords, marker are for get_weather() function
    */
   const [items, setItems] = useState<ItemType[]>([]);
   const [realtimeEvents, setRealtimeEvents] = useState<RealtimeEvent[]>([]);
-  const [expandedEvents, setExpandedEvents] = useState<{
-    [key: string]: boolean;
-  }>({});
+  const [expandedEvents, setExpandedEvents] = useState<{ [key: string]: boolean }>({});
   const [isConnected, setIsConnected] = useState(false);
   const [canPushToTalk, setCanPushToTalk] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
-  const [memoryKv, setMemoryKv] = useState<{ [key: string]: any }>({});
-  const [coords, setCoords] = useState<Coordinates | null>({
-    lat: 37.775593,
-    lng: -122.418137,
-  });
-  const [marker, setMarker] = useState<Coordinates | null>(null);
+  const [isRecordingTalk, setIsRecordingTalk] = useState(false);
+  const [isRecordingListen, setIsRecordingListen] = useState(false);
+  const [isEventsDropdownOpen, setIsEventsDropdownOpen] = useState(false);
+  const [isInterviewMode, setIsInterviewMode] = useState(false);
 
   /**
    * Utility for formatting the timing of logs
@@ -192,6 +178,16 @@ export function ConsolePage() {
     if (client.getTurnDetectionType() === 'server_vad') {
       await wavRecorder.record((data) => client.appendInputAudio(data.mono));
     }
+
+    // Update the session with instructions and VAD settings
+    client.updateSession({
+      instructions: instructions,
+      input_audio_transcription: { model: 'whisper-1' },
+      turn_detection: client.getTurnDetectionType() === 'server_vad' ? {
+        type: 'server_vad',
+        silence_duration_ms: 1000,
+      } : null,
+    });
   }, []);
 
   /**
@@ -201,12 +197,6 @@ export function ConsolePage() {
     setIsConnected(false);
     setRealtimeEvents([]);
     setItems([]);
-    setMemoryKv({});
-    setCoords({
-      lat: 37.775593,
-      lng: -122.418137,
-    });
-    setMarker(null);
 
     const client = clientRef.current;
     client.disconnect();
@@ -228,7 +218,7 @@ export function ConsolePage() {
    * .appendInputAudio() for each sample
    */
   const startRecording = async () => {
-    setIsRecording(true);
+    setIsRecordingTalk(true);
     const client = clientRef.current;
     const wavRecorder = wavRecorderRef.current;
     const wavStreamPlayer = wavStreamPlayerRef.current;
@@ -244,11 +234,95 @@ export function ConsolePage() {
    * In push-to-talk mode, stop recording
    */
   const stopRecording = async () => {
-    setIsRecording(false);
+    setIsRecordingTalk(false);
     const client = clientRef.current;
     const wavRecorder = wavRecorderRef.current;
     await wavRecorder.pause();
     client.createResponse();
+  };
+
+  /**
+   * Utility function to convert Float32Array to Int16Array
+   */
+  const convertFloat32ToInt16 = (buffer: Float32Array) => {
+    let l = buffer.length;
+    const buf = new Int16Array(l);
+    while (l--) {
+      buf[l] = Math.max(-1, Math.min(1, buffer[l])) * 0x7FFF;
+    }
+    return buf;
+  };
+
+  /**
+   * In push-to-listen mode, start recording screen and audio output
+   */
+  const startListening = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+      mediaStreamRef.current = stream;
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        setIsRecordingListen(true);
+        const client = clientRef.current;
+        const wavStreamPlayer = wavStreamPlayerRef.current;
+        const trackSampleOffset = await wavStreamPlayer.interrupt();
+        if (trackSampleOffset?.trackId) {
+          const { trackId, offset } = trackSampleOffset;
+          await client.cancelResponse(trackId, offset);
+        }
+        const audioContext = new AudioContext({ sampleRate: 24000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+
+        // Store the processor to clean up later
+        audioProcessorRef.current = processor;
+
+        processor.onaudioprocess = (e) => {
+          const inputData = e.inputBuffer.getChannelData(0);
+          const inputDataArray = convertFloat32ToInt16(inputData);
+          client.appendInputAudio(inputDataArray);
+        };
+
+        // Handle when the user stops screen sharing
+        stream.getVideoTracks()[0].onended = () => {
+          stopListening();
+        };
+      } else {
+        console.error('No audio track found in the screen recording stream.');
+      }
+    } catch (err) {
+      console.error('Error accessing display media.', err);
+    }
+  };
+
+  /**
+   * In push-to-listen mode, stop recording screen and audio output
+   */
+  const stopListening = async () => {
+    setIsRecordingListen(false);
+    const client = clientRef.current;
+
+    // Stop sending audio data
+    if (audioProcessorRef.current) {
+      audioProcessorRef.current.disconnect();
+      audioProcessorRef.current = null;
+    }
+
+    // Stop media stream
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+
+    // Commit the audio buffer and create response
+    if (client.isConnected()) {
+      client.createResponse();
+    }
   };
 
   /**
@@ -261,7 +335,10 @@ export function ConsolePage() {
       await wavRecorder.pause();
     }
     client.updateSession({
-      turn_detection: value === 'none' ? null : { type: 'server_vad' },
+      turn_detection: value === 'none' ? null : {
+        type: 'server_vad',
+        silence_duration_ms: 1000,
+      },
     });
     if (value === 'server_vad' && client.isConnected()) {
       await wavRecorder.record((data) => client.appendInputAudio(data.mono));
@@ -276,11 +353,9 @@ export function ConsolePage() {
     if (eventsScrollRef.current) {
       const eventsEl = eventsScrollRef.current;
       const scrollHeight = eventsEl.scrollHeight;
-      // Only scroll if height has just changed
-      if (scrollHeight !== eventsScrollHeightRef.current) {
-        eventsEl.scrollTop = scrollHeight;
-        eventsScrollHeightRef.current = scrollHeight;
-      }
+      // Always scroll to the bottom to see the latest events
+      eventsEl.scrollTop = scrollHeight;
+      eventsScrollHeightRef.current = scrollHeight;
     }
   }, [realtimeEvents]);
 
@@ -382,79 +457,6 @@ export function ConsolePage() {
     client.updateSession({ input_audio_transcription: { model: 'whisper-1' } });
 
     // Add tools
-    client.addTool(
-      {
-        name: 'set_memory',
-        description: 'Saves important data about the user into memory.',
-        parameters: {
-          type: 'object',
-          properties: {
-            key: {
-              type: 'string',
-              description:
-                'The key of the memory value. Always use lowercase and underscores, no other characters.',
-            },
-            value: {
-              type: 'string',
-              description: 'Value can be anything represented as a string',
-            },
-          },
-          required: ['key', 'value'],
-        },
-      },
-      async ({ key, value }: { [key: string]: any }) => {
-        setMemoryKv((memoryKv) => {
-          const newKv = { ...memoryKv };
-          newKv[key] = value;
-          return newKv;
-        });
-        return { ok: true };
-      }
-    );
-    client.addTool(
-      {
-        name: 'get_weather',
-        description:
-          'Retrieves the weather for a given lat, lng coordinate pair. Specify a label for the location.',
-        parameters: {
-          type: 'object',
-          properties: {
-            lat: {
-              type: 'number',
-              description: 'Latitude',
-            },
-            lng: {
-              type: 'number',
-              description: 'Longitude',
-            },
-            location: {
-              type: 'string',
-              description: 'Name of the location',
-            },
-          },
-          required: ['lat', 'lng', 'location'],
-        },
-      },
-      async ({ lat, lng, location }: { [key: string]: any }) => {
-        setMarker({ lat, lng, location });
-        setCoords({ lat, lng, location });
-        const result = await fetch(
-          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m`
-        );
-        const json = await result.json();
-        const temperature = {
-          value: json.current.temperature_2m as number,
-          units: json.current_units.temperature_2m as string,
-        };
-        const wind_speed = {
-          value: json.current.wind_speed_10m as number,
-          units: json.current_units.wind_speed_10m as string,
-        };
-        setMarker({ lat, lng, location, temperature, wind_speed });
-        return json;
-      }
-    );
-
     // handle realtime events from client + server for event logging
     client.on('realtime.event', (realtimeEvent: RealtimeEvent) => {
       setRealtimeEvents((realtimeEvents) => {
@@ -506,9 +508,16 @@ export function ConsolePage() {
   return (
     <div data-component="ConsolePage">
       <div className="content-top">
-        <div className="content-title">
-          <img src="/openai-logomark.svg" />
-          <span>realtime console</span>
+        <div className="content-title" style={{ display: 'flex', alignItems: 'center' }}>
+          <span style={{ fontSize: '2em', fontWeight: 'bold', color: '#007acc' }}>Deep.ai</span>
+          <Button
+            label={isConnected ? 'Disconnect' : 'Connect'}
+            iconPosition={isConnected ? 'end' : 'start'}
+            icon={isConnected ? X : Zap}
+            buttonStyle={isConnected ? 'regular' : 'action'}
+            onClick={isConnected ? disconnectConversation : connectConversation}
+            style={{ marginLeft: '20px' }}
+          />
         </div>
         <div className="content-api-key">
           {!LOCAL_RELAY_SERVER_URL && (
@@ -521,208 +530,195 @@ export function ConsolePage() {
             />
           )}
         </div>
-      </div>
-      <div className="content-main">
-        <div className="content-logs">
-          <div className="content-block events">
-            <div className="visualization">
-              <div className="visualization-entry client">
-                <canvas ref={clientCanvasRef} />
-              </div>
-              <div className="visualization-entry server">
-                <canvas ref={serverCanvasRef} />
-              </div>
-            </div>
-            <div className="content-block-title">events</div>
-            <div className="content-block-body" ref={eventsScrollRef}>
-              {!realtimeEvents.length && `awaiting connection...`}
-              {realtimeEvents.map((realtimeEvent, i) => {
-                const count = realtimeEvent.count;
-                const event = { ...realtimeEvent.event };
-                if (event.type === 'input_audio_buffer.append') {
-                  event.audio = `[trimmed: ${event.audio.length} bytes]`;
-                } else if (event.type === 'response.audio.delta') {
-                  event.delta = `[trimmed: ${event.delta.length} bytes]`;
-                }
-                return (
-                  <div className="event" key={event.event_id}>
-                    <div className="event-timestamp">
-                      {formatTime(realtimeEvent.time)}
-                    </div>
-                    <div className="event-details">
-                      <div
-                        className="event-summary"
-                        onClick={() => {
-                          // toggle event details
-                          const id = event.event_id;
-                          const expanded = { ...expandedEvents };
-                          if (expanded[id]) {
-                            delete expanded[id];
-                          } else {
-                            expanded[id] = true;
-                          }
-                          setExpandedEvents(expanded);
-                        }}
-                      >
-                        <div
-                          className={`event-source ${
-                            event.type === 'error'
-                              ? 'error'
-                              : realtimeEvent.source
-                          }`}
-                        >
-                          {realtimeEvent.source === 'client' ? (
-                            <ArrowUp />
-                          ) : (
-                            <ArrowDown />
-                          )}
-                          <span>
-                            {event.type === 'error'
-                              ? 'error!'
-                              : realtimeEvent.source}
-                          </span>
-                        </div>
-                        <div className="event-type">
-                          {event.type}
-                          {count && ` (${count})`}
-                        </div>
-                      </div>
-                      {!!expandedEvents[event.event_id] && (
-                        <div className="event-payload">
-                          {JSON.stringify(event, null, 2)}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          <div className="content-block conversation">
-            <div className="content-block-title">conversation</div>
-            <div className="content-block-body" data-conversation-content>
-              {!items.length && `awaiting connection...`}
-              {items.map((conversationItem, i) => {
-                return (
-                  <div className="conversation-item" key={conversationItem.id}>
-                    <div className={`speaker ${conversationItem.role || ''}`}>
-                      <div>
-                        {(
-                          conversationItem.role || conversationItem.type
-                        ).replaceAll('_', ' ')}
-                      </div>
-                      <div
-                        className="close"
-                        onClick={() =>
-                          deleteConversationItem(conversationItem.id)
-                        }
-                      >
-                        <X />
-                      </div>
-                    </div>
-                    <div className={`speaker-content`}>
-                      {/* tool response */}
-                      {conversationItem.type === 'function_call_output' && (
-                        <div>{conversationItem.formatted.output}</div>
-                      )}
-                      {/* tool call */}
-                      {!!conversationItem.formatted.tool && (
-                        <div>
-                          {conversationItem.formatted.tool.name}(
-                          {conversationItem.formatted.tool.arguments})
-                        </div>
-                      )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'user' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              (conversationItem.formatted.audio?.length
-                                ? '(awaiting transcript)'
-                                : conversationItem.formatted.text ||
-                                  '(item sent)')}
-                          </div>
-                        )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'assistant' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              conversationItem.formatted.text ||
-                              '(truncated)'}
-                          </div>
-                        )}
-                      {conversationItem.formatted.file && (
-                        <audio
-                          src={conversationItem.formatted.file.url}
-                          controls
-                        />
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          <div className="content-actions">
-            <Toggle
-              defaultValue={false}
-              labels={['manual', 'vad']}
-              values={['none', 'server_vad']}
-              onChange={(_, value) => changeTurnEndType(value)}
-            />
-            <div className="spacer" />
-            {isConnected && canPushToTalk && (
-              <Button
-                label={isRecording ? 'release to send' : 'push to talk'}
-                buttonStyle={isRecording ? 'alert' : 'regular'}
-                disabled={!isConnected || !canPushToTalk}
-                onMouseDown={startRecording}
-                onMouseUp={stopRecording}
-              />
-            )}
-            <div className="spacer" />
-            <Button
-              label={isConnected ? 'disconnect' : 'connect'}
-              iconPosition={isConnected ? 'end' : 'start'}
-              icon={isConnected ? X : Zap}
-              buttonStyle={isConnected ? 'regular' : 'action'}
-              onClick={
-                isConnected ? disconnectConversation : connectConversation
-              }
-            />
-          </div>
+        <div className="toggle-container" style={{ position: 'absolute', top: '10px', right: '10px' }}>
+          <Toggle
+            defaultValue="normal"
+            labels={['normal', 'interview']}
+            values={['normal', 'interview']}
+            onChange={(_, value) => setIsInterviewMode(value === 'interview')}
+          />
         </div>
-        <div className="content-right">
-          <div className="content-block map">
-            <div className="content-block-title">get_weather()</div>
-            <div className="content-block-title bottom">
-              {marker?.location || 'not yet retrieved'}
-              {!!marker?.temperature && (
-                <>
-                  <br />
-                  🌡️ {marker.temperature.value} {marker.temperature.units}
-                </>
-              )}
-              {!!marker?.wind_speed && (
-                <>
-                  {' '}
-                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
-                </>
-              )}
+      </div>
+      <div className="content-main" style={{ marginTop: '20px' }}>
+        {isInterviewMode ? (
+          <InterviewPage
+            startListening={startListening}
+            stopListening={stopListening}
+            isRecordingListen={isRecordingListen}
+          />
+        ) : (
+          <div className="content-logs">
+            <div className="content-block conversation" style={{ marginTop: '40px', height: '70vh' }}>
+              <div className="content-block-title">Conversation</div>
+              <div className="content-block-body" data-conversation-content>
+                {!items.length && `Awaiting connection...`}
+                {items.map((conversationItem, i) => {
+                  return (
+                    <div className="conversation-item" key={conversationItem.id}>
+                      <div className={`speaker ${conversationItem.role || ''}`}>
+                        <div>
+                          {(
+                            conversationItem.role || conversationItem.type
+                          ).replaceAll('_', ' ')}
+                        </div>
+                        <div
+                          className="close"
+                          onClick={() =>
+                            deleteConversationItem(conversationItem.id)
+                          }
+                        >
+                          <X />
+                        </div>
+                      </div>
+                      <div className={`speaker-content`}>
+                        {/* tool response */}
+                        {conversationItem.type === 'function_call_output' && (
+                          <div>{conversationItem.formatted.output}</div>
+                        )}
+                        {/* tool call */}
+                        {!!conversationItem.formatted.tool && (
+                          <div>
+                            {conversationItem.formatted.tool.name}(
+                            {conversationItem.formatted.tool.arguments})
+                          </div>
+                        )}
+                        {!conversationItem.formatted.tool &&
+                          conversationItem.role === 'user' && (
+                            <div>
+                              {conversationItem.formatted.transcript ||
+                                (conversationItem.formatted.audio?.length
+                                  ? '(awaiting transcript)'
+                                  : conversationItem.formatted.text ||
+                                    '(item sent)')}
+                            </div>
+                          )}
+                        {!conversationItem.formatted.tool &&
+                          conversationItem.role === 'assistant' && (
+                            <div>
+                              {conversationItem.formatted.transcript ||
+                                conversationItem.formatted.text ||
+                                '(truncated)'}
+                            </div>
+                          )}
+                        {conversationItem.formatted.file && (
+                          <audio
+                            src={conversationItem.formatted.file.url}
+                            controls
+                          />
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-            <div className="content-block-body full">
-              {coords && (
-                <Map
-                  center={[coords.lat, coords.lng]}
-                  location={coords.location}
+            <div className="content-actions">
+              <Toggle
+                defaultValue={false}
+                labels={['manual', 'vad']}
+                values={['none', 'server_vad']}
+                onChange={(_, value) => changeTurnEndType(value)}
+              />
+              <div className="spacer" />
+              {isConnected && canPushToTalk && (
+                <Button
+                  label={isRecordingTalk ? 'Release to Send' : 'Push to Talk'}
+                  buttonStyle={isRecordingTalk ? 'alert' : 'regular'}
+                  disabled={!isConnected || !canPushToTalk}
+                  onMouseDown={startRecording}
+                  onMouseUp={stopRecording}
                 />
               )}
+              <div className="spacer" />
+              {isConnected && canPushToTalk && (
+                <Button
+                  label={isRecordingListen ? 'Stop Listening' : 'Start Listening'}
+                  buttonStyle={isRecordingListen ? 'alert' : 'regular'}
+                  disabled={!isConnected || !canPushToTalk}
+                  onClick={isRecordingListen ? stopListening : startListening}
+                />
+              )}
+              <div className="spacer" />
             </div>
           </div>
-          <div className="content-block kv">
-            <div className="content-block-title">set_memory()</div>
-            <div className="content-block-body content-kv">
-              {JSON.stringify(memoryKv, null, 2)}
+        )}
+      </div>
+      <div className={`events-dropdown ${isEventsDropdownOpen ? 'open' : ''}`}>
+        <div className="events-dropdown-toggle" onClick={() => setIsEventsDropdownOpen(!isEventsDropdownOpen)}>
+          Events
+        </div>
+        <div className="events-dropdown-content">
+          <div className="visualization">
+            <div className="visualization-entry client">
+              <canvas ref={clientCanvasRef} />
             </div>
+            <div className="visualization-entry server">
+              <canvas ref={serverCanvasRef} />
+            </div>
+          </div>
+          <div className="content-block-title">Events</div>
+          <div className="content-block-body" ref={eventsScrollRef}>
+            {!realtimeEvents.length && `Awaiting connection...`}
+            {realtimeEvents.map((realtimeEvent, i) => {
+              const count = realtimeEvent.count;
+              const event = { ...realtimeEvent.event };
+              if (event.type === 'input_audio_buffer.append') {
+                event.audio = `[trimmed: ${event.audio.length} bytes]`;
+              } else if (event.type === 'response.audio.delta') {
+                event.delta = `[trimmed: ${event.delta.length} bytes]`;
+              }
+              return (
+                <div className="event" key={event.event_id}>
+                  <div className="event-timestamp">
+                    {formatTime(realtimeEvent.time)}
+                  </div>
+                  <div className="event-details">
+                    <div
+                      className="event-summary"
+                      onClick={() => {
+                        // toggle event details
+                        const id = event.event_id;
+                        const expanded = { ...expandedEvents };
+                        if (expanded[id]) {
+                          delete expanded[id];
+                        } else {
+                          expanded[id] = true;
+                        }
+                        setExpandedEvents(expanded);
+                      }}
+                    >
+                      <div
+                        className={`event-source ${
+                          event.type === 'error'
+                            ? 'error'
+                            : realtimeEvent.source
+                        }`}
+                      >
+                        {realtimeEvent.source === 'client' ? (
+                          <ArrowUp />
+                        ) : (
+                          <ArrowDown />
+                        )}
+                        <span>
+                          {event.type === 'error'
+                            ? 'Error!'
+                            : realtimeEvent.source}
+                        </span>
+                      </div>
+                      <div className="event-type">
+                        {event.type}
+                        {count && ` (${count})`}
+                      </div>
+                    </div>
+                    {!!expandedEvents[event.event_id] && (
+                      <div className="event-payload">
+                        {JSON.stringify(event, null, 2)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>

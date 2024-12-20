@@ -277,4 +277,48 @@
       }
     }
   }
+
+  .events-dropdown-content {
+    padding: 20px;
+    overflow-y: auto;
+    max-height: 100vh; /* Ensure it doesn't overflow the viewport */
+  }
+}
+
+.events-dropdown {
+  position: fixed;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 300px;
+  transform: translateX(100%);
+  transition: transform 0.3s ease-in-out;
+  background: #fff;
+  box-shadow: -2px 0 5px rgba(0, 0, 0, 0.1);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+}
+
+.events-dropdown.open {
+  transform: translateX(0);
+}
+
+.events-dropdown-toggle {
+  position: absolute;
+  left: -70px; /* Move it more to the left */
+  top: 50%;
+  transform: translateY(-50%);
+  background: #0099ff;
+  color: #fff;
+  padding: 10px 20px; /* Increase padding for better visibility */
+  cursor: pointer;
+  font-weight: bold; /* Make the text bold */
+  border-radius: 5px; /* Add border radius for better appearance */
+}
+
+.events-dropdown-content {
+  padding: 20px;
+  overflow-y: auto;
+  flex-grow: 1;
 }
